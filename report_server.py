@@ -215,6 +215,7 @@ def fetch_dashboard_all(input_date, input_date_iso):
 
     sent_ids = [cid for cid, rec in status_map.items() if rec.get("reportStatus") == "sent"]
     send_log  = {}
+    manually_generated_cids = set()
     for cid in sent_ids:
         try:
             r3 = requests.post(
@@ -223,17 +224,21 @@ def fetch_dashboard_all(input_date, input_date_iso):
             )
             r3.raise_for_status()
             for log in r3.json().get("data", {}).get("result", []):
-                if log.get("logSubType") != "sendReport":
-                    continue
                 if log.get("logData", {}).get("fileDate") != input_date:
                     continue
-                prev = send_log.get(cid)
-                if prev is None or log["createdAt"] > prev["createdAt"]:
-                    send_log[cid] = log
+                sub = log.get("logSubType")
+                if sub == "sendReport":
+                    prev = send_log.get(cid)
+                    if prev is None or log["createdAt"] > prev["createdAt"]:
+                        send_log[cid] = log
+                elif sub == "generateReport":
+                    uname = log.get("userName", "Automatic")
+                    if uname and uname != "Automatic":
+                        manually_generated_cids.add(cid)
         except Exception as e:
             print(f"  Warning: log fetch failed for {cid}: {e}")
-    print(f"  Send logs: {len(send_log)}")
-    return client_map, status_map, send_log
+    print(f"  Send logs: {len(send_log)}  Manually generated: {len(manually_generated_cids)}")
+    return client_map, status_map, send_log, manually_generated_cids
 
 
 # ── OPENSEARCH FETCH (all clients) ────────────────────────────────────────────
@@ -271,9 +276,14 @@ def fetch_opensearch_all(input_date):
         cid = str(ld.get("clientId", ""))
         if not cid or cid in EXCLUDED_IDS:
             continue
+        uname   = log.get("userName", "Automatic")
+        man_gen = bool(uname and uname != "Automatic")
         if cid not in client_info:
             client_info[cid] = {"name": ld.get("reportName", f"Client {cid}"),
-                                 "time_val": "-", "sent_by": "-", "has_send": False}
+                                 "time_val": "-", "sent_by": "-", "has_send": False,
+                                 "manually_generated": man_gen}
+        elif man_gen:
+            client_info[cid]["manually_generated"] = True
 
     for log in send_logs:
         ld  = log.get("logData", {})
@@ -287,7 +297,8 @@ def fetch_opensearch_all(input_date):
         sent_by  = log.get("userName", "Automatic")
         if cid not in client_info:
             client_info[cid] = {"name": ld.get("reportName", f"Client {cid}"),
-                                 "time_val": time_val, "sent_by": sent_by, "has_send": True}
+                                 "time_val": time_val, "sent_by": sent_by, "has_send": True,
+                                 "manually_generated": False}
         else:
             client_info[cid].update({"time_val": time_val, "sent_by": sent_by, "has_send": True})
     return client_info
@@ -349,7 +360,7 @@ def sort_key(r):
     return (4,)
 
 
-def build_summary_html(rows, input_date, last_checked, token_expired, note=""):
+def build_summary_html(rows, input_date, last_checked, token_expired, note="", manually_generated=0):
     total       = len(rows)
     sent        = sum(1 for r in rows if r[6] == "Sent")
     pending     = sum(1 for r in rows if r[6] == "Pending")
@@ -370,7 +381,7 @@ def build_summary_html(rows, input_date, last_checked, token_expired, note=""):
 <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;text-align:center;">
 <tr style="background-color:#f2f2f2;">
   <th>Total Reports</th><th>Sent Reports</th><th>Pending (Active Only)</th>
-  <th>Auto Sent Count</th><th>Manually Sent Count</th>
+  <th>Auto Sent Count</th><th>Manually Sent Count</th><th>Manually Generated Count</th>
 </tr>
 <tr>
   <td>{total}</td>
@@ -378,6 +389,7 @@ def build_summary_html(rows, input_date, last_checked, token_expired, note=""):
   <td style="background-color:#f8d7da;">{pending}</td>
   <td style="background-color:#cce5ff;">{auto_sent}</td>
   <td style="background-color:#fff3cd;">{manual_sent}</td>
+  <td style="background-color:#e8d5f5;">{manually_generated}</td>
 </tr>
 </table><br><br>
 """
@@ -385,16 +397,19 @@ def build_summary_html(rows, input_date, last_checked, token_expired, note=""):
 
 
 # ── 6:30 AM REPORT TASK ───────────────────────────────────────────────────────
-def run_early_report():
+def run_early_report(recipients=None):
+    recipients = recipients or RECEIVER_EMAIL
     yesterday      = datetime.now(ist) - timedelta(days=1)
     input_date     = yesterday.strftime("%d-%m-%Y")
     input_date_iso = yesterday.strftime("%Y-%m-%d")
     print(f"\n[Early] Fetching report for: {input_date}")
 
-    token_expired = False
+    token_expired     = False
+    manually_generated = 0
     try:
-        client_map, status_map, send_log = fetch_dashboard_all(input_date, input_date_iso)
+        client_map, status_map, send_log, manual_gen_cids = fetch_dashboard_all(input_date, input_date_iso)
         rows = build_rows_dashboard(input_date, client_map, status_map, send_log)
+        manually_generated = sum(1 for r in rows if r[2] in manual_gen_cids)
         data_source = "Dashboard"
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
@@ -405,6 +420,7 @@ def run_early_report():
             rows = [[input_date, i["name"], cid, "Active", i["time_val"], i["sent_by"],
                      "Sent" if i["has_send"] else "Pending"]
                     for cid, i in client_info.items()]
+            manually_generated = sum(1 for i in client_info.values() if i.get("manually_generated"))
             data_source = "OpenSearch"
         else:
             print(f"  HTTP error: {e}")
@@ -414,13 +430,14 @@ def run_early_report():
     key_rows   = [r for r in rows if r[1].lower() in KEY_NAMES_LOWER]
     other_rows = [r for r in rows if r[1].lower() not in KEY_NAMES_LOWER]
 
-    html  = build_summary_html(rows, input_date, "6:30 AM", token_expired)
+    html  = build_summary_html(rows, input_date, "6:30 AM", token_expired,
+                               manually_generated=manually_generated)
     html += build_table("Key Clients", key_rows)
     html += "<br><br>"
     html += build_table("Other Clients", other_rows)
 
     subject = f"Report Status - {input_date}"
-    msg_id  = send_brevo(subject, html, RECEIVER_EMAIL,
+    msg_id  = send_brevo(subject, html, recipients,
                          rows_to_csv_bytes(rows), f"Early_Report_{input_date}.csv")
     if msg_id:
         with _lock:
@@ -430,16 +447,19 @@ def run_early_report():
 
 
 # ── 9:30 AM REPORT TASK ───────────────────────────────────────────────────────
-def run_morning_report():
+def run_morning_report(recipients=None):
+    recipients = recipients or RECEIVER_EMAIL
     yesterday      = datetime.now(ist) - timedelta(days=1)
     input_date     = yesterday.strftime("%d-%m-%Y")
     input_date_iso = yesterday.strftime("%Y-%m-%d")
     print(f"\n[Morning] Fetching report for: {input_date}")
 
-    token_expired = False
+    token_expired     = False
+    manually_generated = 0
     try:
-        client_map, status_map, send_log = fetch_dashboard_all(input_date, input_date_iso)
+        client_map, status_map, send_log, manual_gen_cids = fetch_dashboard_all(input_date, input_date_iso)
         rows = build_rows_dashboard(input_date, client_map, status_map, send_log)
+        manually_generated = sum(1 for r in rows if r[2] in manual_gen_cids)
         data_source = "Dashboard"
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
@@ -450,6 +470,7 @@ def run_morning_report():
             rows = [[input_date, i["name"], cid, "Active", i["time_val"], i["sent_by"],
                      "Sent" if i["has_send"] else "Pending"]
                     for cid, i in client_info.items()]
+            manually_generated = sum(1 for i in client_info.values() if i.get("manually_generated"))
             data_source = "OpenSearch"
         else:
             print(f"  HTTP error: {e}")
@@ -464,13 +485,14 @@ def run_morning_report():
     if not reply_to:
         reply_to = db_get_early_msg_id(input_date)
 
-    html  = build_summary_html(rows, input_date, "9:30 AM", token_expired)
+    html  = build_summary_html(rows, input_date, "9:30 AM", token_expired,
+                               manually_generated=manually_generated)
     html += build_table("Key Clients", key_rows)
     html += "<br><br>"
     html += build_table("Other Clients", other_rows)
 
     subject = f"Report Status - {input_date}"
-    msg_id  = send_brevo(subject, html, RECEIVER_EMAIL,
+    msg_id  = send_brevo(subject, html, recipients,
                          rows_to_csv_bytes(rows), f"Report_Timing_{input_date}.csv",
                          reply_to_msg_id=reply_to)
     if msg_id:
@@ -481,10 +503,12 @@ def run_morning_report():
 
 
 # ── 12:00 PM MIDDAY CHECK TASK ────────────────────────────────────────────────
-def run_midday_check(input_date, input_date_iso):
+def run_midday_check(input_date, input_date_iso, recipients=None):
+    recipients = recipients or RECEIVER_EMAIL
     print(f"\n[Midday] Checking for: {input_date}")
-    token_expired = False
+    token_expired    = False
     token_alert_done = False
+    manually_generated = 0
 
     try:
         auth  = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -497,7 +521,6 @@ def run_midday_check(input_date, input_date_iso):
             (str(c["clientId"]) for c in all_clients
              if c["clientName"].lower() == GO_COLORS_LOWER), None,
         )
-        all_ids_str = [str(c["clientId"]) for c in all_clients]
         print(f"  Go Colors ID: {go_colors_id}")
 
         # Quick Go Colors check
@@ -520,8 +543,9 @@ def run_midday_check(input_date, input_date_iso):
             return
 
         print("  Go Colors confirmed sent — fetching all clients.")
-        client_map, status_map, send_log = fetch_dashboard_all(input_date, input_date_iso)
+        client_map, status_map, send_log, manual_gen_cids = fetch_dashboard_all(input_date, input_date_iso)
         rows = build_rows_dashboard(input_date, client_map, status_map, send_log)
+        manually_generated = sum(1 for r in rows if r[2] in manual_gen_cids)
         data_source = "Dashboard"
 
     except requests.HTTPError as e:
@@ -542,6 +566,7 @@ def run_midday_check(input_date, input_date_iso):
             rows = [[input_date, i["name"], cid, "Active", i["time_val"], i["sent_by"],
                      "Sent" if i["has_send"] else "Pending"]
                     for cid, i in client_info.items()]
+            manually_generated = sum(1 for i in client_info.values() if i.get("manually_generated"))
             data_source = "OpenSearch"
         else:
             print(f"  HTTP error: {e}")
@@ -558,15 +583,15 @@ def run_midday_check(input_date, input_date_iso):
     other_rows = [r for r in rows if r[1].lower() not in KEY_NAMES_LOWER]
 
     last_checked = datetime.now(ist).strftime("%I:%M %p")
-    note = f'<p style="color:#555;">Triggered at {last_checked} after Go Colors confirmed sent.</p>'
 
-    html  = build_summary_html(rows, input_date, last_checked, token_expired, note="")
+    html  = build_summary_html(rows, input_date, last_checked, token_expired,
+                               manually_generated=manually_generated)
     html += build_table("Key Clients", key_rows)
     html += "<br><br>"
     html += build_table("Other Clients", other_rows)
 
     subject = f"Report Status - {input_date}"
-    send_brevo(subject, html, RECEIVER_EMAIL,
+    send_brevo(subject, html, recipients,
                rows_to_csv_bytes(rows), f"Midday_Report_{input_date}.csv",
                reply_to_msg_id=reply_to)
     print(f"  [Midday] Mail sent. Source: {data_source}  Last checked: {last_checked}")
@@ -611,6 +636,19 @@ def midday_check():
     threading.Thread(target=run_midday_check,
                      args=(input_date, input_date_iso), daemon=True).start()
     return jsonify({"status": "checking", "date": input_date}), 200
+
+
+@app.route("/tasks/test-report")
+def test_report():
+    if request.args.get("key") != CRON_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    threading.Thread(
+        target=run_morning_report,
+        kwargs={"recipients": "sabarishwar@tangotech.co.in"},
+        daemon=True,
+    ).start()
+    return jsonify({"status": "started", "task": "test-report",
+                    "recipients": "sabarishwar@tangotech.co.in"}), 200
 
 
 def fetch_send_log_parallel(sent_ids, date_str, jsonh):
