@@ -62,8 +62,13 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS report_thread_ids (
                         date TEXT PRIMARY KEY,
                         early_msg_id TEXT,
-                        morning_msg_id TEXT
+                        morning_msg_id TEXT,
+                        midday_sent BOOLEAN DEFAULT FALSE
                     )
+                """)
+                cur.execute("""
+                    ALTER TABLE report_thread_ids
+                    ADD COLUMN IF NOT EXISTS midday_sent BOOLEAN DEFAULT FALSE
                 """)
         print("  DB ready")
     except Exception as e:
@@ -117,6 +122,37 @@ def db_get_reply_to(date):
     except Exception as e:
         print(f"  DB read error: {e}")
         return None
+
+
+def db_is_midday_sent(date):
+    if not NEON_DATABASE_URL:
+        return False
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT midday_sent FROM report_thread_ids WHERE date = %s", (date,)
+                )
+                row = cur.fetchone()
+                return bool(row and row[0])
+    except Exception as e:
+        print(f"  DB midday check error: {e}")
+        return False
+
+def db_mark_midday_sent(date):
+    if not NEON_DATABASE_URL:
+        return
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO report_thread_ids (date, midday_sent) VALUES (%s, TRUE) "
+                    "ON CONFLICT (date) DO UPDATE SET midday_sent = TRUE",
+                    (date,),
+                )
+        print(f"  DB marked midday_sent for {date}")
+    except Exception as e:
+        print(f"  DB midday mark error: {e}")
 
 
 init_db()
@@ -559,6 +595,7 @@ def run_midday_check(input_date, input_date_iso, recipients=None):
         reply_to = _morning_msg_ids.get(input_date) or _early_msg_ids.get(input_date)
     if not reply_to:
         reply_to = db_get_reply_to(input_date)
+    db_mark_midday_sent(input_date)
 
     rows.sort(key=sort_key)
     key_rows   = [r for r in rows if r[1].lower() in KEY_NAMES_LOWER]
@@ -613,6 +650,11 @@ def midday_check():
     with _lock:
         if input_date in _midday_sent:
             return jsonify({"status": "already_sent", "date": input_date}), 200
+
+    if db_is_midday_sent(input_date):
+        with _lock:
+            _midday_sent.add(input_date)
+        return jsonify({"status": "already_sent", "date": input_date}), 200
 
     threading.Thread(target=run_midday_check,
                      args=(input_date, input_date_iso), daemon=True).start()
