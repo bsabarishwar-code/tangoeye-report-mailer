@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
@@ -10,12 +10,14 @@ import io
 app = Flask(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-CRON_SECRET    = os.environ.get("CRON_SECRET",          "changeme")
-API_TOKEN      = os.environ.get("DASHBOARD_API_TOKEN",  "9f0a75c6-097a-422c-883c-5946fb2d0d2f")
-BREVO_API_KEY  = os.environ.get("BREVO_API_KEY",        "")
-SENDER_EMAIL   = os.environ.get("SENDER_EMAIL",         "tangoeye.ops@gmail.com")
-SENDER_NAME    = os.environ.get("SENDER_NAME",          "TangoEye Reports")
-RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAILS",      "sabarishwar@tangotech.co.in,ravichandran@tangotech.co.in,lokesh@tangotech.co.in")
+CRON_SECRET    = os.environ.get("CRON_SECRET",         "changeme")
+API_TOKEN      = os.environ.get("DASHBOARD_API_TOKEN", "9f0a75c6-097a-422c-883c-5946fb2d0d2f")
+BREVO_API_KEY  = os.environ.get("BREVO_API_KEY",       "")
+SENDER_EMAIL   = os.environ.get("SENDER_EMAIL",        "tangoeye.ops@gmail.com")
+SENDER_NAME    = os.environ.get("SENDER_NAME",         "TangoEye Reports")
+RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAILS",
+    "sabarishwar@tangotech.co.in,ravichandran@tangotech.co.in,lokesh@tangotech.co.in,"
+    "Hariharan@tangotech.co.in,Prasannavenkatesh@tangotech.co.in")
 ALERT_EMAIL    = "sabarishwar@tangotech.co.in"
 
 OS_HOST  = "search-tango-prod-7dsufau4cxzttx6yt7dqc3rzme.ap-south-1.es.amazonaws.com"
@@ -24,11 +26,10 @@ OS_PASS  = os.environ.get("OPENSEARCH_PASS", "T@ng0#2024")
 OS_INDEX = "tango-audit-activity-logs"
 
 API_BASE = "https://dashboard-api.tangoeye.ai/v3"
+ist      = timezone(timedelta(hours=5, minutes=30))
 
-ist = timezone(timedelta(hours=5, minutes=30))
-
-EXCLUDED_IDS = {"201", "425", "458", "468", "520"}
-PRIORITY_IDS = {"193", "455", "185", "460", "94", "469", "95", "409", "4", "11", "322", "434"}
+EXCLUDED_IDS    = {"201", "425", "458", "468", "520"}
+GO_COLORS_LOWER = "go colors"
 
 KEY_CLIENT_NAMES = [
     "Owndays", "Rivoli", "The Souled Store", "Woodenstreet Furnitures",
@@ -45,17 +46,19 @@ KEY_CLIENT_NAMES = [
     "Ethera Diamonds",
 ]
 KEY_NAMES_LOWER = {n.lower() for n in KEY_CLIENT_NAMES}
-GO_COLORS_LOWER = "go colors"
 
 STATUS_MAP = {"active": "Active", "deactive": "Deactivated", "suspended": "Hold"}
 
-# In-memory set to prevent duplicate midday emails on the same date
-_midday_sent = set()
-_midday_lock = threading.Lock()
+# In-memory threading state (persists while service is running)
+_lock            = threading.Lock()
+_midday_sent     = set()    # dates already emailed at midday
+_early_msg_ids   = {}       # date → messageId of 6:30 AM email
+_morning_msg_ids = {}       # date → messageId of 9:30 AM email
 
 
-# ── BREVO HELPER ──────────────────────────────────────────────────────────────
-def send_brevo(subject, html_body, to_csv, csv_bytes=None, csv_filename=None):
+# ── BREVO ─────────────────────────────────────────────────────────────────────
+def send_brevo(subject, html_body, to_csv, csv_bytes=None, csv_filename=None,
+               reply_to_msg_id=None):
     to_list = [{"email": e.strip()} for e in to_csv.split(",") if e.strip()]
     payload = {
         "sender":      {"name": SENDER_NAME, "email": SENDER_EMAIL},
@@ -66,12 +69,18 @@ def send_brevo(subject, html_body, to_csv, csv_bytes=None, csv_filename=None):
     if csv_bytes and csv_filename:
         payload["attachment"] = [{"content": base64.b64encode(csv_bytes).decode(),
                                   "name":    csv_filename}]
+    if reply_to_msg_id:
+        payload["headers"] = {
+            "In-Reply-To": reply_to_msg_id,
+            "References":  reply_to_msg_id,
+        }
     resp = requests.post(
         "https://api.brevo.com/v3/smtp/email",
         headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
         json=payload, timeout=30,
     )
     resp.raise_for_status()
+    return resp.json().get("messageId")
 
 
 def rows_to_csv_bytes(rows):
@@ -83,7 +92,17 @@ def rows_to_csv_bytes(rows):
     return buf.getvalue().encode("utf-8")
 
 
-# ── SHARED: DASHBOARD FETCH (all clients, any date) ──────────────────────────
+def send_token_alert(input_date, script_name):
+    html = f"""
+    <h3 style="color:#c0392b;">Dashboard Token Expired</h3>
+    <p>Report for <b>{input_date}</b> was generated using <b>OpenSearch</b> as fallback.</p>
+    <p>Open GitHub repo → edit <code>{script_name}</code> → update the token → commit.</p>
+    """
+    send_brevo(f"ACTION REQUIRED: Dashboard Token Expired – {input_date}", html, ALERT_EMAIL)
+    print(f"  Token alert sent to {ALERT_EMAIL}")
+
+
+# ── DASHBOARD FETCH (all clients) ─────────────────────────────────────────────
 def fetch_dashboard_all(input_date, input_date_iso):
     auth  = {"Authorization": f"Bearer {API_TOKEN}"}
     jsonh = {**auth, "Content-Type": "application/json"}
@@ -124,8 +143,7 @@ def fetch_dashboard_all(input_date, input_date_iso):
         try:
             r3 = requests.post(
                 f"{API_BASE}/report/get-report-log", headers=jsonh,
-                json={"clientId": cid, "fileDate": input_date},
-                timeout=30,
+                json={"clientId": cid, "fileDate": input_date}, timeout=30,
             )
             r3.raise_for_status()
             for log in r3.json().get("data", {}).get("result", []):
@@ -139,11 +157,10 @@ def fetch_dashboard_all(input_date, input_date_iso):
         except Exception as e:
             print(f"  Warning: log fetch failed for {cid}: {e}")
     print(f"  Send logs: {len(send_log)}")
-
     return client_map, status_map, send_log
 
 
-# ── SHARED: OPENSEARCH FETCH (all clients, any date) ─────────────────────────
+# ── OPENSEARCH FETCH (all clients) ────────────────────────────────────────────
 def fetch_opensearch_all(input_date):
     from opensearchpy import OpenSearch, RequestsHttpConnection
     osc = OpenSearch(
@@ -171,7 +188,6 @@ def fetch_opensearch_all(input_date):
 
     send_logs     = query_logs("sendReport")
     generate_logs = query_logs("generateReport")
-    print(f"  OS sendReport: {len(send_logs)}  generateReport: {len(generate_logs)}")
 
     client_info = {}
     for log in generate_logs:
@@ -198,11 +214,10 @@ def fetch_opensearch_all(input_date):
                                  "time_val": time_val, "sent_by": sent_by, "has_send": True}
         else:
             client_info[cid].update({"time_val": time_val, "sent_by": sent_by, "has_send": True})
-
     return client_info
 
 
-# ── SHARED: BUILD ROWS FROM DASHBOARD DATA ────────────────────────────────────
+# ── BUILD ROWS FROM DASHBOARD DATA ────────────────────────────────────────────
 def build_rows_dashboard(input_date, client_map, status_map, send_log):
     rows = []
     for cid, name in client_map.items():
@@ -225,7 +240,7 @@ def build_rows_dashboard(input_date, client_map, status_map, send_log):
     return rows
 
 
-# ── SHARED: HTML BUILDERS ─────────────────────────────────────────────────────
+# ── HTML BUILDERS ─────────────────────────────────────────────────────────────
 TABLE_HEADER = """
 <tr style="background-color:#f2f2f2;">
   <th>Date</th><th>Client Name</th><th>Client ID</th><th>Client Status</th>
@@ -238,11 +253,10 @@ def build_table(title, row_list):
     out += '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;">'
     out += TABLE_HEADER
     for r in row_list:
-        s, rs, t = r[3], r[6], r[4]
-        if s in ("Deactivated", "Hold"):      color = "#d1ecf1"
-        elif rs == "Pending":                 color = "#f8d7da"
-        elif t >= "08:00:00":                 color = "#ffe5b4"
-        else:                                 color = "#d4edda"
+        rs, t = r[6], r[4]
+        if rs == "Pending":                 color = "#f8d7da"
+        elif t >= "08:00:00":               color = "#ffe5b4"
+        else:                               color = "#d4edda"
         out += f"<tr style='background-color:{color};'>"
         for cell in r:
             out += f"<td>{cell}</td>"
@@ -252,15 +266,93 @@ def build_table(title, row_list):
 
 
 def sort_key(r):
-    s, rs, t = r[3], r[6], r[4]
-    if s in ("Deactivated", "Hold"):     return (4,)
+    rs, t = r[6], r[4]
     if rs == "Pending":                  return (1,)
     if rs == "Sent" and t >= "08:00:00": return (2, t)
     if rs == "Sent":                     return (3, t)
-    return (5,)
+    return (4,)
 
 
-# ── MORNING REPORT TASK ───────────────────────────────────────────────────────
+def build_summary_html(rows, input_date, last_checked, token_expired, note=""):
+    total       = len(rows)
+    sent        = sum(1 for r in rows if r[6] == "Sent")
+    pending     = sum(1 for r in rows if r[6] == "Pending")
+    auto_sent   = sum(1 for r in rows if r[6] == "Sent" and r[5] == "Automatic")
+    manual_sent = sum(1 for r in rows if r[6] == "Sent" and r[5] not in ("Automatic", "-"))
+
+    source_note = (
+        '<p style="color:#e67e22;font-weight:bold;">⚠ Data sourced from OpenSearch — '
+        'dashboard token expired. Check your email for update instructions.</p>'
+    ) if token_expired else ""
+
+    html = f"""
+<h3>Report Status - {input_date}</h3>
+<p style="color:#555; font-size:13px;"><b>Last checked: {last_checked}</b></p>
+{note}
+{source_note}
+<h4>Summary</h4>
+<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;text-align:center;">
+<tr style="background-color:#f2f2f2;">
+  <th>Total Reports</th><th>Sent Reports</th><th>Pending (Active Only)</th>
+  <th>Auto Sent Count</th><th>Manually Sent Count</th>
+</tr>
+<tr>
+  <td>{total}</td>
+  <td style="background-color:#d4edda;">{sent}</td>
+  <td style="background-color:#f8d7da;">{pending}</td>
+  <td style="background-color:#cce5ff;">{auto_sent}</td>
+  <td style="background-color:#fff3cd;">{manual_sent}</td>
+</tr>
+</table><br><br>
+"""
+    return html
+
+
+# ── 6:30 AM REPORT TASK ───────────────────────────────────────────────────────
+def run_early_report():
+    yesterday      = datetime.now(ist) - timedelta(days=1)
+    input_date     = yesterday.strftime("%d-%m-%Y")
+    input_date_iso = yesterday.strftime("%Y-%m-%d")
+    print(f"\n[Early] Fetching report for: {input_date}")
+
+    token_expired = False
+    try:
+        client_map, status_map, send_log = fetch_dashboard_all(input_date, input_date_iso)
+        rows = build_rows_dashboard(input_date, client_map, status_map, send_log)
+        data_source = "Dashboard"
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            print("  Token expired — OpenSearch fallback")
+            token_expired = True
+            send_token_alert(input_date, "report_server.py")
+            client_info = fetch_opensearch_all(input_date)
+            rows = [[input_date, i["name"], cid, "Active", i["time_val"], i["sent_by"],
+                     "Sent" if i["has_send"] else "Pending"]
+                    for cid, i in client_info.items()]
+            data_source = "OpenSearch"
+        else:
+            print(f"  HTTP error: {e}")
+            return
+
+    rows.sort(key=sort_key)
+    key_rows   = [r for r in rows if r[1].lower() in KEY_NAMES_LOWER]
+    other_rows = [r for r in rows if r[1].lower() not in KEY_NAMES_LOWER]
+
+    html  = build_summary_html(rows, input_date, "6:30 AM", token_expired)
+    html += build_table("Key Clients", key_rows)
+    html += "<br><br>"
+    html += build_table("Other Clients", other_rows)
+
+    subject = f"Report Status - {input_date}"
+    msg_id  = send_brevo(subject, html, RECEIVER_EMAIL,
+                         rows_to_csv_bytes(rows), f"Early_Report_{input_date}.csv")
+    if msg_id:
+        with _lock:
+            _early_msg_ids[input_date] = msg_id
+    print(f"  [Early] Mail sent. Source: {data_source}  msgId: {msg_id}")
+
+
+# ── 9:30 AM REPORT TASK ───────────────────────────────────────────────────────
 def run_morning_report():
     yesterday      = datetime.now(ist) - timedelta(days=1)
     input_date     = yesterday.strftime("%d-%m-%Y")
@@ -276,82 +368,59 @@ def run_morning_report():
         if e.response is not None and e.response.status_code in (401, 403):
             print("  Token expired — OpenSearch fallback")
             token_expired = True
-            _send_token_alert(input_date, "report_mail.py")
+            send_token_alert(input_date, "report_server.py")
             client_info = fetch_opensearch_all(input_date)
-            rows = []
-            for cid, info in client_info.items():
-                rs = "Sent" if info["has_send"] else "Pending"
-                rows.append([input_date, info["name"], cid, "Active",
-                             info["time_val"], info["sent_by"], rs])
+            rows = [[input_date, i["name"], cid, "Active", i["time_val"], i["sent_by"],
+                     "Sent" if i["has_send"] else "Pending"]
+                    for cid, i in client_info.items()]
             data_source = "OpenSearch"
         else:
             print(f"  HTTP error: {e}")
             return
 
     rows.sort(key=sort_key)
-    priority_rows = [r for r in rows if r[2] in PRIORITY_IDS]
-    other_rows    = [r for r in rows if r[2] not in PRIORITY_IDS]
+    key_rows   = [r for r in rows if r[1].lower() in KEY_NAMES_LOWER]
+    other_rows = [r for r in rows if r[1].lower() not in KEY_NAMES_LOWER]
 
-    total   = len(rows)
-    sent    = sum(1 for r in rows if r[6] == "Sent")
-    pending = sum(1 for r in rows if r[6] == "Pending")
-    deact   = sum(1 for r in rows if r[3] in ("Deactivated", "Hold"))
+    with _lock:
+        reply_to = _early_msg_ids.get(input_date)
 
-    source_note = (
-        '<p style="color:#e67e22;font-weight:bold;">⚠ Data sourced from OpenSearch — '
-        'dashboard token expired. Check your email for update instructions.</p>'
-    ) if token_expired else ""
-
-    html = f"""
-<h3>Report Status - {input_date}</h3>
-{source_note}
-<h4>Summary</h4>
-<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;text-align:center;">
-<tr style="background-color:#f2f2f2;">
-  <th>Total Reports</th><th>Deactivated + Hold</th><th>Sent Reports</th><th>Pending (Active Only)</th>
-</tr>
-<tr>
-  <td>{total}</td>
-  <td style="background-color:#e2e3e5;">{deact}</td>
-  <td style="background-color:#d4edda;">{sent}</td>
-  <td style="background-color:#f8d7da;">{pending}</td>
-</tr>
-</table><br><br>
-"""
-    html += build_table("Key Clients", priority_rows)
+    html  = build_summary_html(rows, input_date, "9:30 AM", token_expired)
+    html += build_table("Key Clients", key_rows)
     html += "<br><br>"
     html += build_table("Other Clients", other_rows)
 
-    csv_bytes = rows_to_csv_bytes(rows)
-    send_brevo(f"Report Status - {input_date}", html, RECEIVER_EMAIL,
-               csv_bytes, f"Report_Timing_{input_date}.csv")
-    print(f"  [Morning] Mail sent. Source: {data_source}")
+    subject = f"Report Status - {input_date}"
+    msg_id  = send_brevo(subject, html, RECEIVER_EMAIL,
+                         rows_to_csv_bytes(rows), f"Report_Timing_{input_date}.csv",
+                         reply_to_msg_id=reply_to)
+    if msg_id:
+        with _lock:
+            _morning_msg_ids[input_date] = msg_id
+    print(f"  [Morning] Mail sent. Source: {data_source}  msgId: {msg_id}")
 
 
-# ── MIDDAY CHECK TASK ─────────────────────────────────────────────────────────
+# ── 12:00 PM MIDDAY CHECK TASK ────────────────────────────────────────────────
 def run_midday_check(input_date, input_date_iso):
-    print(f"\n[Midday] Checking Go Colors for: {input_date}")
-
+    print(f"\n[Midday] Checking for: {input_date}")
     token_expired = False
+    token_alert_done = False
+
     try:
         auth  = {"Authorization": f"Bearer {API_TOKEN}"}
         jsonh = {**auth, "Content-Type": "application/json"}
 
         r = requests.get(f"{API_BASE}/client/get-clients", headers=auth, timeout=30)
         r.raise_for_status()
-        all_clients = r.json()["data"]["result"]
-
+        all_clients  = r.json()["data"]["result"]
         go_colors_id = next(
             (str(c["clientId"]) for c in all_clients
-             if c["clientName"].lower() == GO_COLORS_LOWER),
-            None,
+             if c["clientName"].lower() == GO_COLORS_LOWER), None,
         )
+        all_ids_str = [str(c["clientId"]) for c in all_clients]
         print(f"  Go Colors ID: {go_colors_id}")
 
-        all_ids_str = [str(c["clientId"]) for c in all_clients]
-        client_map  = {str(c["clientId"]): c["clientName"] for c in all_clients}
-
-        # Check Go Colors status
+        # Quick Go Colors check
         r2 = requests.post(
             f"{API_BASE}/report/client-list-table", headers=jsonh,
             json={"fromDate": input_date_iso, "toDate": input_date_iso,
@@ -371,8 +440,6 @@ def run_midday_check(input_date, input_date_iso):
             return
 
         print("  Go Colors confirmed sent — fetching all clients.")
-
-        # Fetch all clients for full report
         client_map, status_map, send_log = fetch_dashboard_all(input_date, input_date_iso)
         rows = build_rows_dashboard(input_date, client_map, status_map, send_log)
         data_source = "Dashboard"
@@ -381,82 +448,46 @@ def run_midday_check(input_date, input_date_iso):
         if e.response is not None and e.response.status_code in (401, 403):
             print("  Token expired — OpenSearch fallback")
             token_expired = True
-            _send_token_alert(input_date, "report_mail_midday.py")
+            if not token_alert_done:
+                send_token_alert(input_date, "report_server.py")
+                token_alert_done = True
             client_info = fetch_opensearch_all(input_date)
-
             go_sent = any(
-                info["has_send"] and name == GO_COLORS_LOWER
-                for name, info in (
-                    (client_info[cid]["name"].lower(), client_info[cid])
-                    for cid in client_info
-                )
+                i["has_send"] and i["name"].lower() == GO_COLORS_LOWER
+                for i in client_info.values()
             )
             if not go_sent:
                 print("  Go Colors not yet sent (OpenSearch) — skipping.")
                 return
-
-            rows = []
-            for cid, info in client_info.items():
-                rs = "Sent" if info["has_send"] else "Pending"
-                rows.append([input_date, info["name"], cid, "Active",
-                             info["time_val"], info["sent_by"], rs])
+            rows = [[input_date, i["name"], cid, "Active", i["time_val"], i["sent_by"],
+                     "Sent" if i["has_send"] else "Pending"]
+                    for cid, i in client_info.items()]
             data_source = "OpenSearch"
         else:
             print(f"  HTTP error: {e}")
             return
 
-    # Mark as sent (prevent duplicate if service restarts mid-day)
-    with _midday_lock:
+    with _lock:
         _midday_sent.add(input_date)
+        reply_to = _morning_msg_ids.get(input_date) or _early_msg_ids.get(input_date)
 
     rows.sort(key=sort_key)
     key_rows   = [r for r in rows if r[1].lower() in KEY_NAMES_LOWER]
     other_rows = [r for r in rows if r[1].lower() not in KEY_NAMES_LOWER]
 
-    total   = len(rows)
-    sent    = sum(1 for r in rows if r[6] == "Sent")
-    pending = sum(1 for r in rows if r[6] == "Pending")
-    triggered_at = datetime.now(ist).strftime("%I:%M %p IST")
+    last_checked = datetime.now(ist).strftime("%I:%M %p")
+    note = f'<p style="color:#555;">Triggered at {last_checked} after Go Colors confirmed sent.</p>'
 
-    source_note = (
-        '<p style="color:#e67e22;font-weight:bold;">⚠ Data sourced from OpenSearch — '
-        'dashboard token expired. Check your email for update instructions.</p>'
-    ) if token_expired else ""
-
-    html = f"""
-<h3>Midday Report Check - {input_date}</h3>
-<p style="color:#555;">Triggered at {triggered_at} after Go Colors confirmed sent.</p>
-{source_note}
-<h4>Summary</h4>
-<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;text-align:center;">
-<tr style="background-color:#f2f2f2;">
-  <th>Total Reports</th><th>Sent Reports</th><th>Pending (Active Only)</th>
-</tr>
-<tr>
-  <td>{total}</td>
-  <td style="background-color:#d4edda;">{sent}</td>
-  <td style="background-color:#f8d7da;">{pending}</td>
-</tr>
-</table><br><br>
-"""
+    html  = build_summary_html(rows, input_date, last_checked, token_expired, note="")
     html += build_table("Key Clients", key_rows)
     html += "<br><br>"
     html += build_table("Other Clients", other_rows)
 
-    csv_bytes = rows_to_csv_bytes(rows)
-    send_brevo(f"Midday Report Check - {input_date}", html, RECEIVER_EMAIL,
-               csv_bytes, f"Midday_Report_{input_date}.csv")
-    print(f"  [Midday] Mail sent. Source: {data_source}")
-
-
-def _send_token_alert(input_date, filename):
-    html = f"""
-    <h3 style="color:#c0392b;">Dashboard Token Expired</h3>
-    <p>Report for <b>{input_date}</b> was generated using <b>OpenSearch</b> as fallback.</p>
-    <p>To restore: open the GitHub repo → edit <code>{filename}</code> → update the token default value → commit.</p>
-    """
-    send_brevo(f"ACTION REQUIRED: Dashboard Token Expired – {input_date}", html, ALERT_EMAIL)
-    print(f"  Token alert sent to {ALERT_EMAIL}")
+    subject = f"Report Status - {input_date}"
+    send_brevo(subject, html, RECEIVER_EMAIL,
+               rows_to_csv_bytes(rows), f"Midday_Report_{input_date}.csv",
+               reply_to_msg_id=reply_to)
+    print(f"  [Midday] Mail sent. Source: {data_source}  Last checked: {last_checked}")
 
 
 # ── FLASK ROUTES ──────────────────────────────────────────────────────────────
@@ -466,12 +497,19 @@ def health():
     return jsonify({"status": "ok", "time": now}), 200
 
 
+@app.route("/tasks/early-report")
+def early_report():
+    if request.args.get("key") != CRON_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    threading.Thread(target=run_early_report, daemon=True).start()
+    return jsonify({"status": "started", "task": "early-report"}), 200
+
+
 @app.route("/tasks/morning-report")
 def morning_report():
     if request.args.get("key") != CRON_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
-    thread = threading.Thread(target=run_morning_report, daemon=True)
-    thread.start()
+    threading.Thread(target=run_morning_report, daemon=True).start()
     return jsonify({"status": "started", "task": "morning-report"}), 200
 
 
@@ -484,15 +522,51 @@ def midday_check():
     input_date     = yesterday.strftime("%d-%m-%Y")
     input_date_iso = yesterday.strftime("%Y-%m-%d")
 
-    with _midday_lock:
+    with _lock:
         if input_date in _midday_sent:
             return jsonify({"status": "already_sent", "date": input_date}), 200
 
-    thread = threading.Thread(
-        target=run_midday_check, args=(input_date, input_date_iso), daemon=True
-    )
-    thread.start()
+    threading.Thread(target=run_midday_check,
+                     args=(input_date, input_date_iso), daemon=True).start()
     return jsonify({"status": "checking", "date": input_date}), 200
+
+
+@app.route("/report/export-csv", methods=["GET"])
+def export_csv():
+    """
+    GET /report/export-csv?date=24-06-2026
+    date is optional — defaults to yesterday (IST).
+    Returns a CSV file download with all active clients' report timing.
+    """
+    date_param = request.args.get("date")
+    if date_param:
+        try:
+            datetime.strptime(date_param, "%d-%m-%Y")
+        except ValueError:
+            return jsonify({"error": "date must be DD-MM-YYYY e.g. 24-06-2026"}), 400
+        date_str = date_param
+    else:
+        date_str = (datetime.now(ist) - timedelta(days=1)).strftime("%d-%m-%Y")
+
+    date_iso = datetime.strptime(date_str, "%d-%m-%Y").strftime("%Y-%m-%d")
+
+    try:
+        client_map, status_map, send_log = fetch_dashboard_all(date_str, date_iso)
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 0
+        return jsonify({"error": f"Upstream API error: {code}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    rows = build_rows_dashboard(date_str, client_map, status_map, send_log)
+    rows.sort(key=sort_key)
+
+    filename = f"Report_Timing_{date_str}.csv"
+    return Response(
+        rows_to_csv_bytes(rows),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 if __name__ == "__main__":
