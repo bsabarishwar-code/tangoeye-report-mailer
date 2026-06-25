@@ -772,12 +772,20 @@ def export_csv():
     rows = build_rows_dashboard(date_str, client_map, status_map, send_log, {})
     rows.sort(key=sort_key)
 
-    filename = f"Report_Timing_{date_str}.csv"
-    return Response(
-        rows_to_csv_bytes(rows),
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
+    # columns: Date, Client ID, Client Name, Report Sent Time, Report Status
+    data = [[r[0], r[2], r[1], r[4], r[6]] for r in rows]
+    headers = ["Date", "Client ID", "Client Name", "Report Sent Time", "Report Status"]
+
+    col_widths = [max(len(str(r[i])) for r in [headers] + data) for i in range(5)]
+
+    def fmt_row(r):
+        return "  ".join(str(r[i]).ljust(col_widths[i]) for i in range(5))
+
+    separator = "  ".join("-" * w for w in col_widths)
+    lines = [fmt_row(headers), separator] + [fmt_row(r) for r in data]
+    lines.append(f"\nTotal: {len(data)} clients")
+
+    return Response("\n".join(lines), mimetype="text/plain")
 
 
 if __name__ == "__main__":
