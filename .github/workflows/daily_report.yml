@@ -18,10 +18,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r Data/requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run report script
-        run: python Data/report_mail.py
+        run: python report_mail.py
         env:
           DASHBOARD_API_TOKEN: ${{ secrets.DASHBOARD_API_TOKEN }}
           BREVO_API_KEY:        ${{ secrets.BREVO_API_KEY }}
