@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tangoeye-report-mailer
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn report_server:app
+    envVars:
+      - key: DASHBOARD_API_TOKEN
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: SENDER_EMAIL
+        sync: false
+      - key: SENDER_NAME
+        sync: false
+      - key: RECEIVER_EMAILS
+        sync: false
+      - key: OPENSEARCH_USER
+        sync: false
+      - key: OPENSEARCH_PASS
+        sync: false
+      - key: CRON_SECRET
+        sync: false
