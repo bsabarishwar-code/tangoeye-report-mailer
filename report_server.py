@@ -769,7 +769,7 @@ def export_csv():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    rows = build_rows_dashboard(date_str, client_map, status_map, send_log)
+    rows = build_rows_dashboard(date_str, client_map, status_map, send_log, {})
     rows.sort(key=sort_key)
 
     filename = f"Report_Timing_{date_str}.csv"
