@@ -2,3 +2,4 @@ requests
 opensearch-py
 flask
 gunicorn
+psycopg2-binary

@@ -10,8 +10,9 @@ import io
 app = Flask(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-CRON_SECRET    = os.environ.get("CRON_SECRET",         "changeme")
-API_TOKEN      = os.environ.get("DASHBOARD_API_TOKEN", "9f0a75c6-097a-422c-883c-5946fb2d0d2f")
+CRON_SECRET        = os.environ.get("CRON_SECRET",         "changeme")
+NEON_DATABASE_URL  = os.environ.get("NEON_DATABASE_URL",  "")
+API_TOKEN          = os.environ.get("DASHBOARD_API_TOKEN", "9f0a75c6-097a-422c-883c-5946fb2d0d2f")
 BREVO_API_KEY  = os.environ.get("BREVO_API_KEY",       "")
 SENDER_EMAIL   = os.environ.get("SENDER_EMAIL",        "tangoeye.ops@gmail.com")
 SENDER_NAME    = os.environ.get("SENDER_NAME",         "TangoEye Reports")
@@ -49,11 +50,86 @@ KEY_NAMES_LOWER = {n.lower() for n in KEY_CLIENT_NAMES}
 
 STATUS_MAP = {"active": "Active", "deactive": "Deactivated", "suspended": "Hold"}
 
-# In-memory threading state (persists while service is running)
+# In-memory threading state (fallback when DB is unavailable)
 _lock            = threading.Lock()
-_midday_sent     = set()    # dates already emailed at midday
-_early_msg_ids   = {}       # date → messageId of 6:30 AM email
-_morning_msg_ids = {}       # date → messageId of 9:30 AM email
+_midday_sent     = set()
+_early_msg_ids   = {}
+_morning_msg_ids = {}
+
+
+# ── NEON DB (thread ID persistence across Render restarts) ────────────────────
+def _db_conn():
+    import psycopg2
+    return psycopg2.connect(NEON_DATABASE_URL, sslmode="require")
+
+def init_db():
+    if not NEON_DATABASE_URL:
+        return
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS report_thread_ids (
+                        date TEXT PRIMARY KEY,
+                        early_msg_id TEXT,
+                        morning_msg_id TEXT
+                    )
+                """)
+        print("  DB ready")
+    except Exception as e:
+        print(f"  DB init error: {e}")
+
+def db_save_msg_id(date, slot, msg_id):
+    if not NEON_DATABASE_URL or not msg_id:
+        return
+    if slot not in ("early_msg_id", "morning_msg_id"):
+        return
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO report_thread_ids (date, {slot}) VALUES (%s, %s) "
+                    f"ON CONFLICT (date) DO UPDATE SET {slot} = EXCLUDED.{slot}",
+                    (date, msg_id),
+                )
+        print(f"  DB saved {slot} for {date}")
+    except Exception as e:
+        print(f"  DB save error: {e}")
+
+def db_get_early_msg_id(date):
+    if not NEON_DATABASE_URL:
+        return None
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT early_msg_id FROM report_thread_ids WHERE date = %s", (date,))
+                row = cur.fetchone()
+                return row[0] if row else None
+    except Exception as e:
+        print(f"  DB read error: {e}")
+        return None
+
+def db_get_reply_to(date):
+    """Returns morning_msg_id if present, else early_msg_id — for midday threading."""
+    if not NEON_DATABASE_URL:
+        return None
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT early_msg_id, morning_msg_id FROM report_thread_ids WHERE date = %s",
+                    (date,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[1] or row[0]
+        return None
+    except Exception as e:
+        print(f"  DB read error: {e}")
+        return None
+
+
+init_db()
 
 
 # ── BREVO ─────────────────────────────────────────────────────────────────────
@@ -349,6 +425,7 @@ def run_early_report():
     if msg_id:
         with _lock:
             _early_msg_ids[input_date] = msg_id
+        db_save_msg_id(input_date, "early_msg_id", msg_id)
     print(f"  [Early] Mail sent. Source: {data_source}  msgId: {msg_id}")
 
 
@@ -384,6 +461,8 @@ def run_morning_report():
 
     with _lock:
         reply_to = _early_msg_ids.get(input_date)
+    if not reply_to:
+        reply_to = db_get_early_msg_id(input_date)
 
     html  = build_summary_html(rows, input_date, "9:30 AM", token_expired)
     html += build_table("Key Clients", key_rows)
@@ -397,6 +476,7 @@ def run_morning_report():
     if msg_id:
         with _lock:
             _morning_msg_ids[input_date] = msg_id
+        db_save_msg_id(input_date, "morning_msg_id", msg_id)
     print(f"  [Morning] Mail sent. Source: {data_source}  msgId: {msg_id}")
 
 
@@ -470,6 +550,8 @@ def run_midday_check(input_date, input_date_iso):
     with _lock:
         _midday_sent.add(input_date)
         reply_to = _morning_msg_ids.get(input_date) or _early_msg_ids.get(input_date)
+    if not reply_to:
+        reply_to = db_get_reply_to(input_date)
 
     rows.sort(key=sort_key)
     key_rows   = [r for r in rows if r[1].lower() in KEY_NAMES_LOWER]
