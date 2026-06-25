@@ -531,6 +531,39 @@ def midday_check():
     return jsonify({"status": "checking", "date": input_date}), 200
 
 
+def fetch_send_log_parallel(sent_ids, date_str, jsonh):
+    """Fetch report logs for all sent clients in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def fetch_one(cid):
+        try:
+            r = requests.post(
+                f"{API_BASE}/report/get-report-log", headers=jsonh,
+                json={"clientId": cid, "fileDate": date_str}, timeout=20,
+            )
+            r.raise_for_status()
+            best = None
+            for log in r.json().get("data", {}).get("result", []):
+                if log.get("logSubType") != "sendReport":
+                    continue
+                if log.get("logData", {}).get("fileDate") != date_str:
+                    continue
+                if best is None or log["createdAt"] > best["createdAt"]:
+                    best = log
+            return cid, best
+        except Exception:
+            return cid, None
+
+    send_log = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(fetch_one, cid): cid for cid in sent_ids}
+        for future in as_completed(futures):
+            cid, entry = future.result()
+            if entry:
+                send_log[cid] = entry
+    return send_log
+
+
 @app.route("/report/export-csv", methods=["GET"])
 def export_csv():
     """
@@ -551,7 +584,42 @@ def export_csv():
     date_iso = datetime.strptime(date_str, "%d-%m-%Y").strftime("%Y-%m-%d")
 
     try:
-        client_map, status_map, send_log = fetch_dashboard_all(date_str, date_iso)
+        auth  = {"Authorization": f"Bearer {API_TOKEN}"}
+        jsonh = {**auth, "Content-Type": "application/json"}
+
+        # Step 1 — all clients
+        r = requests.get(f"{API_BASE}/client/get-clients", headers=auth, timeout=30)
+        r.raise_for_status()
+        all_clients = r.json()["data"]["result"]
+        all_ids_str = [str(c["clientId"]) for c in all_clients]
+        client_map  = {str(c["clientId"]): c["clientName"] for c in all_clients}
+
+        # Step 2 — report status (paginated)
+        status_map, offset, limit = {}, 1, 500
+        while True:
+            r2 = requests.post(
+                f"{API_BASE}/report/client-list-table", headers=jsonh,
+                json={"fromDate": date_iso, "toDate": date_iso,
+                      "clientId": all_ids_str, "reportStatus": "",
+                      "sortBy": -1, "limit": limit, "offset": offset},
+                timeout=30,
+            )
+            r2.raise_for_status()
+            if r2.status_code == 204 or not r2.content:
+                break
+            body   = r2.json()
+            result = body.get("data", {}).get("result", [])
+            total  = body.get("data", {}).get("count", 0)
+            for rec in result:
+                status_map[str(rec["tangoId"])] = rec
+            if not result or len(status_map) >= total:
+                break
+            offset += limit
+
+        # Step 3 — logs in parallel
+        sent_ids = [cid for cid, rec in status_map.items() if rec.get("reportStatus") == "sent"]
+        send_log = fetch_send_log_parallel(sent_ids, date_str, jsonh)
+
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else 0
         return jsonify({"error": f"Upstream API error: {code}"}), 502

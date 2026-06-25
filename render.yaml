@@ -3,7 +3,7 @@ services:
     name: tangoeye-report-mailer
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn report_server:app
+    startCommand: gunicorn --timeout 120 --workers 1 report_server:app
     envVars:
       - key: DASHBOARD_API_TOKEN
         sync: false
