@@ -5,7 +5,7 @@ import base64
 import os
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-API_TOKEN      = os.environ.get("DASHBOARD_API_TOKEN", "9f0a75c6-097a-422c-883c-5946fb2d0d2f")
+API_TOKEN      = os.environ.get("DASHBOARD_API_TOKEN", "b0005a2b-5370-47a7-ae81-2ecf31dd7b94")
 BREVO_API_KEY  = os.environ.get("BREVO_API_KEY",       "")
 SENDER_EMAIL   = os.environ.get("SENDER_EMAIL",        "tangoeye.ops@gmail.com")
 SENDER_NAME    = os.environ.get("SENDER_NAME",         "TangoEye Reports")
